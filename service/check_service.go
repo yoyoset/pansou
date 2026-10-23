@@ -601,6 +601,8 @@ func (s *CheckService) recheckBaiduSharePage(ctx context.Context, item model.Che
 	}
 	req.Header.Set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 	req.Header.Set("accept", "text/html")
+	// 百度的 404 页声明 gzip 但内容不是 gzip，Go 自动解压会报 "gzip: invalid header"，所以显式不要压缩
+	req.Header.Set("accept-encoding", "identity")
 	resp, err := noRedirect.Do(req)
 	if err != nil {
 		return fallback
@@ -608,7 +610,7 @@ func (s *CheckService) recheckBaiduSharePage(ctx context.Context, item model.Che
 	defer resp.Body.Close()
 	body, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
 	if err != nil {
-		return fallback
+		body = nil // 正文读不出来时状态码和跳转地址仍然可用
 	}
 
 	switch classifyBaiduSharePage(resp.StatusCode, resp.Header.Get("Location"), body) {

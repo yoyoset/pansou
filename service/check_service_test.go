@@ -244,3 +244,30 @@ func TestCheckBaiduSharePageRecheck(test *testing.T) {
 		})
 	}
 }
+
+type checkErrReader struct{}
+
+func (checkErrReader) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+
+func TestCheckBaiduSharePageUnreadableBody(test *testing.T) {
+	// 百度 404 页实测声明 gzip 却解不开；正文读失败时仍应按状态码判失效
+	client := &http.Client{Transport: checkRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path == "/share/list" {
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"errno":9019,"errmsg":"need verify"}`)), Request: request}, nil
+		}
+		if got := request.Header.Get("accept-encoding"); got != "identity" {
+			test.Fatalf("share page should be requested without compression, got accept-encoding %q", got)
+		}
+		return &http.Response{StatusCode: http.StatusNotFound, Header: http.Header{}, Body: io.NopCloser(checkErrReader{}), Request: request}, nil
+	})}
+	service := &CheckService{}
+	item := model.CheckItem{DiskType: "baidu", URL: "https://pan.baidu.com/s/1abc"}
+
+	result, err := service.checkBaidu(item, item.URL, client)
+	if err != nil {
+		test.Fatalf("checkBaidu returned an error: %v", err)
+	}
+	if result.State != checkStateBad {
+		test.Fatalf("expected bad, got %#v", result)
+	}
+}
