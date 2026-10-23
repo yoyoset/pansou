@@ -501,9 +501,9 @@ func (s *CheckService) checkBaidu(item model.CheckItem, normalized string, clien
 		case 0:
 			bdclnd = verifyResp.Randsk
 		case -9, -12:
-			return s.buildResult(item, normalized, checkStateLocked, false, "提取码错误或缺失"), nil
+			return s.recheckBaiduSharePage(ctx, item, normalized, shortURL, true, s.buildResult(item, normalized, checkStateLocked, false, "提取码错误或缺失")), nil
 		default:
-			return s.buildResult(item, normalized, checkStateUncertain, false, verifyResp.Errmsg), nil
+			return s.recheckBaiduSharePage(ctx, item, normalized, shortURL, true, s.buildResult(item, normalized, checkStateUncertain, false, verifyResp.Errmsg)), nil
 		}
 	}
 
@@ -536,12 +536,95 @@ func (s *CheckService) checkBaidu(item model.CheckItem, normalized string, clien
 		}
 		return s.buildResult(item, normalized, checkStateBad, false, "链接失效"), nil
 	case -9, -12:
-		return s.buildResult(item, normalized, checkStateLocked, false, "需要提取码"), nil
+		return s.recheckBaiduSharePage(ctx, item, normalized, shortURL, password != "", s.buildResult(item, normalized, checkStateLocked, false, "需要提取码")), nil
 	case -7, 105, 115, 117, 145:
 		return s.buildResult(item, normalized, checkStateBad, false, "链接失效"), nil
 	default:
-		return s.buildResult(item, normalized, checkStateUncertain, false, listResp.Errmsg), nil
+		return s.recheckBaiduSharePage(ctx, item, normalized, shortURL, password != "", s.buildResult(item, normalized, checkStateUncertain, false, listResp.Errmsg)), nil
 	}
+}
+
+// 百度分享页判定结果
+const (
+	baiduPageDead     = "dead"      // 404 或标题「链接不存在」
+	baiduPagePublic   = "public"    // 公开分享，可直接访问
+	baiduPageNeedsPwd = "needs_pwd" // 分享存在，跳转到提取码页
+)
+
+var baiduPageDeadTitles = []string{"链接不存在", "页面不存在", "分享的文件已经被取消", "分享的文件已经被删除", "涉及侵权"}
+
+var baiduPageTitlePattern = regexp.MustCompile(`(?s)<title>(.*?)</title>`)
+
+// classifyBaiduSharePage 根据 https://pan.baidu.com/s/<id>（不跟随跳转）的响应判断分享状态，判断不了返回空串。
+// share/list 对无提取码的链接一律返回 errno 9019 "need verify"，失效链接也落在这里，只能靠分享页区分。
+func classifyBaiduSharePage(statusCode int, location string, body []byte) string {
+	if statusCode == http.StatusNotFound {
+		return baiduPageDead
+	}
+	if statusCode >= 300 && statusCode < 400 {
+		if strings.Contains(location, "share/init") {
+			return baiduPageNeedsPwd
+		}
+		return ""
+	}
+	if statusCode != http.StatusOK {
+		return ""
+	}
+	title := ""
+	if matches := baiduPageTitlePattern.FindSubmatch(body); len(matches) > 1 {
+		title = string(matches[1])
+	}
+	if containsAny(title, baiduPageDeadTitles) {
+		return baiduPageDead
+	}
+	if strings.Contains(string(body), `"errortype":-1`) {
+		return baiduPagePublic
+	}
+	return ""
+}
+
+// recheckBaiduSharePage 在 share/list / verify 给不出确定结论（uncertain / locked）时用分享页复查，复查失败则保持原结论。
+func (s *CheckService) recheckBaiduSharePage(ctx context.Context, item model.CheckItem, normalized, shortURL string, hasPassword bool, fallback model.CheckResult) model.CheckResult {
+	base := checkHTTPClientFromContext(ctx)
+	if base == nil {
+		base = s.client
+	}
+	if base == nil {
+		base = http.DefaultClient
+	}
+	noRedirect := *base
+	noRedirect.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://pan.baidu.com/s/1"+shortURL, nil)
+	if err != nil {
+		return fallback
+	}
+	req.Header.Set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+	req.Header.Set("accept", "text/html")
+	resp, err := noRedirect.Do(req)
+	if err != nil {
+		return fallback
+	}
+	defer resp.Body.Close()
+	body, err := util.ReadAllLimited(resp.Body, util.MaxUpstreamResponseBytes)
+	if err != nil {
+		return fallback
+	}
+
+	switch classifyBaiduSharePage(resp.StatusCode, resp.Header.Get("Location"), body) {
+	case baiduPageDead:
+		return s.buildResult(item, normalized, checkStateBad, false, "链接失效")
+	case baiduPagePublic:
+		return s.buildResult(item, normalized, checkStateOK, false, "链接有效")
+	case baiduPageNeedsPwd:
+		if !hasPassword {
+			return s.buildResult(item, normalized, checkStateLocked, false, "需要提取码")
+		}
+		if fallback.State == checkStateLocked {
+			return s.buildResult(item, normalized, checkStateLocked, false, "提取码错误")
+		}
+	}
+	return fallback
 }
 
 func (s *CheckService) checkTianyi(item model.CheckItem, normalized string, client *http.Client) (model.CheckResult, error) {

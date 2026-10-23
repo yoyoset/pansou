@@ -175,3 +175,72 @@ func TestCheck115ShareState(test *testing.T) {
 		})
 	}
 }
+
+func TestCheckBaiduSharePageRecheck(test *testing.T) {
+	// 夹具来自 2026-10-23 对真实百度接口的观测：无提取码的链接 share/list 一律回 9019，
+	// 失效分享页 200 + 标题「链接不存在」或 404，公开分享页 200 + "errortype":-1，需提取码的分享 302 到 share/init。
+	const deadPage = `<html><head><title>百度网盘-链接不存在</title></head><div class="share-error">"errortype":1</div>`
+	const publicPage = `<html><head><title>我的三体_免费高速下载|百度网盘-分享无限制</title></head>"errortype":-1`
+	const notFoundPage = `<html><head><title>页面不存在</title></head>啊哦，你所访问的页面不存在了`
+
+	testCases := []struct {
+		name        string
+		url         string
+		verify      string
+		list        string
+		pageStatus  int
+		pageBody    string
+		wantState   string
+		wantSummary string
+	}{
+		{"no password, cancelled share", "https://pan.baidu.com/s/1abc", "", `{"errno":9019,"errmsg":"need verify"}`, http.StatusOK, deadPage, checkStateBad, "链接失效"},
+		{"no password, page 404", "https://pan.baidu.com/s/1abc", "", `{"errno":9019,"errmsg":"need verify"}`, http.StatusNotFound, notFoundPage, checkStateBad, "链接失效"},
+		{"no password, public share", "https://pan.baidu.com/s/1abc", "", `{"errno":9019,"errmsg":"need verify"}`, http.StatusOK, publicPage, checkStateOK, "链接有效"},
+		{"no password, share needs password", "https://pan.baidu.com/s/1abc", "", `{"errno":9019,"errmsg":"need verify"}`, http.StatusFound, "", checkStateLocked, "需要提取码"},
+		{"no password, unknown page keeps uncertain", "https://pan.baidu.com/s/1abc", "", `{"errno":9019,"errmsg":"need verify"}`, http.StatusOK, `<title>百度网盘</title>`, checkStateUncertain, "need verify"},
+		{"password rejected, share cancelled", "https://pan.baidu.com/s/1abc?pwd=7z55", `{"errno":-9}`, "", http.StatusOK, deadPage, checkStateBad, "链接失效"},
+		{"password rejected, share exists", "https://pan.baidu.com/s/1abc?pwd=h75X", `{"errno":-9}`, "", http.StatusFound, "", checkStateLocked, "提取码错误"},
+		{"password accepted, list ok skips page", "https://pan.baidu.com/s/1abc?pwd=8888", `{"errno":0,"randsk":"x"}`, `{"errno":0,"list":[{"fs_id":1}]}`, 0, "", checkStateOK, "链接有效"},
+	}
+
+	for _, testCase := range testCases {
+		test.Run(testCase.name, func(test *testing.T) {
+			pageRequested := false
+			client := &http.Client{Transport: checkRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
+				respond := func(status int, body string, header http.Header) (*http.Response, error) {
+					if header == nil {
+						header = http.Header{}
+					}
+					return &http.Response{StatusCode: status, Header: header, Body: io.NopCloser(strings.NewReader(body)), Request: request}, nil
+				}
+				switch request.URL.Path {
+				case "/share/verify":
+					return respond(http.StatusOK, testCase.verify, nil)
+				case "/share/list":
+					return respond(http.StatusOK, testCase.list, nil)
+				case "/s/1abc":
+					pageRequested = true
+					if testCase.pageStatus == http.StatusFound {
+						return respond(http.StatusFound, "", http.Header{"Location": []string{"https://pan.baidu.com/share/init?surl=abc"}})
+					}
+					return respond(testCase.pageStatus, testCase.pageBody, nil)
+				}
+				test.Fatalf("unexpected request: %s %s", request.Method, request.URL)
+				return nil, nil
+			})}
+			service := &CheckService{}
+			item := model.CheckItem{DiskType: "baidu", URL: testCase.url}
+
+			result, err := service.checkBaidu(item, item.URL, client)
+			if err != nil {
+				test.Fatalf("checkBaidu returned an error: %v", err)
+			}
+			if result.State != testCase.wantState || result.Summary != testCase.wantSummary {
+				test.Fatalf("expected state %q and summary %q, got %#v", testCase.wantState, testCase.wantSummary, result)
+			}
+			if testCase.pageStatus == 0 && pageRequested {
+				test.Fatalf("share page should not be requested when share/list is conclusive")
+			}
+		})
+	}
+}
